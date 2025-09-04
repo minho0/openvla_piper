@@ -2,20 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 OpenVLA(8bit) → 7-DoF (EE-local Δpose6 + gripper_mm) → IK(j1..6 rad) → V2 ticks → PiPER(CAN, no ROS)
-- Instruction 터미널 입력 지원 (미지정 시)
-- Emergency Stop: Ctrl+C 또는 'e' 키 (best-effort: 현재자세 유지 재명령 + 속도 0)
+- Terminal instruction 입력 지원 (미지정 시)
+- E-Stop: Ctrl+C 또는 'e' 키 (best-effort: 속도=0, 현재자세 재명령)
 
 조인트 스케일: rad → milli-deg(틱) = rad * 180/pi * 1000
-그리퍼 스케일: meter → um(틱)     = m * 1e6  (OpenVLA는 grip_mm이므로 mm/1000 → m)
-
-예시:
-  python3 openvla_to_piper_8bit_v2_estop.py \
-    --model_path openvla/openvla-7b \
-    --image_path rgb.jpg \
-    --can can0 \
-    --urdf piper_description.urdf
+그리퍼 스케일: mm → m → um(틱)   = (mm/1000) * 1e6
 """
 
+import re, math
 import argparse, json, time, sys, signal, threading, tty, termios, os, math
 from pathlib import Path
 from typing import List, Optional
@@ -28,8 +22,8 @@ from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConf
 from transforms3d.euler import euler2mat, mat2euler
 from ikpy.chain import Chain
 
-# PiPER V2 SDK (네가 성공했던 경로)
-from piper_sdk import C_PiperInterface_V2, LogLevel
+# PiPER V2 SDK
+from piper_sdk import C_PiperInterface_V2, LogLevel  # noqa: F401 (LogLevel for completeness)
 
 # --------------------------
 # E-Stop globals
@@ -83,43 +77,122 @@ def grip_mm_to_tick(mm: float) -> int:
     meters = float(mm) / 1000.0
     return int(round(meters * 1_000_000))
 
+
+# JOINT_NAMES 전역 추가
+def debug_chain(chain):
+    print("\n[IK] Links dump (idx, is_joint, name):")
+    for i, l in enumerate(chain.links):
+        print(f"  {i:2d} | {getattr(l,'is_joint',False)} | {l.name}")
+    print()
+
+def resolve_joint_names(chain) -> list:
+    """URDF에서 6개 조인트 이름을 결정."""
+    link_names = [l.name for l in chain.links]
+    candidates = [
+        ["joint1","joint2","joint3","joint4","joint5","joint6"],
+        ["joint_1","joint_2","joint_3","joint_4","joint_5","joint_6"],
+        ["J1","J2","J3","J4","J5","J6"],
+        ["shoulder_pan_joint","shoulder_lift_joint","elbow_joint",
+         "wrist_1_joint","wrist_2_joint","wrist_3_joint"],
+    ]
+    for cand in candidates:
+        if all(n in link_names for n in cand):
+            return cand
+    # 폴백: joint 타입 링크 앞의 6개
+    auto = [l.name for l in chain.links if getattr(l, "is_joint", False)][:6]
+    if len(auto) != 6:
+        raise RuntimeError(f"URDF에서 6개 조인트를 결정하지 못했습니다. joint-count={len(auto)}")
+    return auto
+
+def set_active_mask_for_six(chain, joint_names):
+    """6개 조인트 이름만 True로. is_joint 여부는 무시(ikpy가 잘못 표기하는 케이스 회피)."""
+    jset = set(joint_names)
+    mask = [(l.name in jset) for l in chain.links]   # <-- is_joint 조건 제거
+    chain.active_links_mask = mask
+    n_active = sum(mask)
+    if n_active != 6:
+        raise RuntimeError(f"active_links_mask={n_active} (≠6). joint_names={joint_names}")
+
 # --------------------------
 # IK / FK (URDF)
 # --------------------------
-def build_chain(urdf_path: str, last_link: str = "gripper_base") -> Chain:
-    chain = Chain.from_urdf_file(
-        urdf_path,
-        base_elements=["base_link"],
-        last_link=last_link,
-    )
-    mask = [False] * len(chain.links)
-    names = [lnk.name for lnk in chain.links]
-    for link_name in ["link1","link2","link3","link4","link5","link6"]:
-        if link_name in names:
-            mask[names.index(link_name)] = True
-    chain.active_links_mask = mask
-    return chain
 
-def fk_from_q(chain: Chain, q6: List[float]) -> np.ndarray:
-    q_all = [0.0] * len(chain.links)
+def build_chain(urdf_path: str) -> Chain:
+    # chain = Chain.from_urdf_file(
+    #     urdf_path,
+    #     base_elements=["base_link"]
+    # )
+    # # 링크별 활성 마스크: 조인트만 True, 나머지 False
+    # mask = []
+    # for lnk in chain.links:
+    #     is_joint = getattr(lnk, "is_joint", False)
+    #     name = getattr(lnk, "name", "")
+    #     # 확실히 제외해야 하는 fixed 링크들
+    #     if name in ("Base link", "base_link", "joint6_to_gripper_base", "tool0", "ee_link"):
+    #         mask.append(False)
+    #     else:
+    #         mask.append(bool(is_joint))
+    # # joint1..joint6만 남기고 나머지 조인트는 끄고 싶다면 여기를 추가:
+    # JOINT_SET = set(["joint1","joint2","joint3","joint4","joint5","joint6"])
+    # for i, lnk in enumerate(chain.links):
+    #     if getattr(lnk, "is_joint", False) and lnk.name not in JOINT_SET:
+    #         mask[i] = False
+
+    # chain.active_links_mask = mask
+    # return chain
+    return Chain.from_urdf_file(urdf_path, base_elements=["base_link"])
+
+
+def fk_from_q(chain: Chain, q6):
+    """
+    q6: [j1..j6] (rad)
+    ikpy는 chain.links 길이만큼 각도를 주길 원하므로,
+    joint1..6 인덱스를 찾아서 해당 위치에 q6를 꽂아줌.
+    """
     names = [lnk.name for lnk in chain.links]
-    for i, link_name in enumerate(["link1","link2","link3","link4","link5","link6"]):
-        idx = names.index(link_name); q_all[idx] = float(q6[i])
+    q_all = [0.0] * len(chain.links)
+    for i, jn in enumerate(JOINT_NAMES):
+        try:
+            idx = names.index(jn)
+        except ValueError:
+            raise RuntimeError(f"URDF/chain에 '{jn}' 조인트가 없습니다. names={names}")
+        q_all[idx] = float(q6[i])
     return chain.forward_kinematics(q_all)
 
-def ik_to_q(chain: Chain, T_target: np.ndarray, q_init_from_curr: Optional[List[float]] = None) -> List[float]:
+def ik_to_q(chain: Chain, T_target, q_init_from_curr=None):
+    """
+    inverse_kinematics_frame()은 전체 길이의 초기값을 받음.
+    - q_init_from_curr: [j1..j6] (rad)
+    반환도 [j1..j6] 순서로 뽑아서 리턴.
+    """
+    names = [lnk.name for lnk in chain.links]
     q_init_full = [0.0] * len(chain.links)
     if q_init_from_curr is not None:
-        names = [lnk.name for lnk in chain.links]
-        for i, link_name in enumerate(["link1","link2","link3","link4","link5","link6"]):
-            idx = names.index(link_name); q_init_full[idx] = float(q_init_from_curr[i])
+        for i, jn in enumerate(JOINT_NAMES):
+            try:
+                idx = names.index(jn)
+            except ValueError:
+                raise RuntimeError(f"URDF/chain에 '{jn}' 조인트가 없습니다. names={names}")
+            q_init_full[idx] = float(q_init_from_curr[i])
+
     q_all = chain.inverse_kinematics_frame(
-        T_target, initial_position=q_init_full, max_iter=200, target_orientation_weight=1.0
+        T_target,
+        initial_position=q_init_full,
+        max_iter=200,
+        orientation_mode="all"  
     )
-    names = [lnk.name for lnk in chain.links]
-    return [float(q_all[names.index(nm)]) for nm in ["link1","link2","link3","link4","link5","link6"]]
+
+    q6 = []
+    for jn in JOINT_NAMES:
+        try:
+            idx = names.index(jn)
+        except ValueError:
+            raise RuntimeError(f"URDF/chain에 '{jn}' 조인트가 없습니다. names={names}")
+        q6.append(float(q_all[idx]))
+    return q6
 
 def compose_local_delta(T_current: np.ndarray, dx, dy, dz, dr, dp, dyaw, axes='sxyz') -> np.ndarray:
+    """EE 로컬 Δpose 적용: T_target = T_current · ΔT_local"""
     R_delta = euler2mat(dr, dp, dyaw, axes=axes)
     Delta = np.eye(4); Delta[:3,:3] = R_delta; Delta[:3,3] = np.array([dx,dy,dz], dtype=float)
     return T_current @ Delta
@@ -156,44 +229,214 @@ def load_image(image_path: str = None, image_url: str = None) -> Image.Image:
 # --------------------------
 # V2 helpers (feedback + estop)
 # --------------------------
-def try_read_current_joints_v2(p: C_PiperInterface_V2) -> Optional[List[float]]:
-    """
-    V2에서 현재 조인트(rad) 추출 시도.
-    장비/SDK 빌드마다 리턴타입이 다를 수 있어 보수적으로 처리.
-    네 데모에선 GetArmJointCtrl()가 잘 동작했다고 했으므로 우선 사용.
-    """
-    try:
-        msg = p.GetArmJointCtrl()
-        # 흔한 케이스 1) 리스트/튜플로 rad 값 6개
-        if isinstance(msg, (list, tuple)) and len(msg) >= 6:
-            return [float(msg[i]) for i in range(6)]
-        # 케이스 2) 객체의 속성 경로로 탐색
-        out = []
-        for i in range(1, 7):
-            val = None
-            for path in [f"joint_{i}.position", f"motor_{i}.angle_rad",
-                         f"j{i}.position", f"motor_{i}.position"]:
-                obj = msg; ok = True
-                for attr in path.split('.'):
-                    if not hasattr(obj, attr): ok = False; break
-                    obj = getattr(obj, attr)
-                if ok:
-                    val = float(obj); break
-            if val is None: return None
-            out.append(val)
-        return out
-    except Exception:
+
+_JOINT_NAME_SETS = [
+    ("joint_1","joint_2","joint_3","joint_4","joint_5","joint_6"),
+    ("Joint_1","Joint_2","Joint_3","Joint_4","Joint_5","Joint_6"),
+    ("joint1","joint2","joint3","joint4","joint5","joint6"),
+    ("j1","j2","j3","j4","j5","j6"),
+    ("q1","q2","q3","q4","q5","q6"),
+]
+_JOINT_REGEX = re.compile(r"Joint[_\s]?([1-6])\s*:\s*(-?\d+(?:\.\d+)?)")
+
+
+def _unit_to_rad(vec6):
+    m = max(abs(float(x)) for x in vec6)
+    if m > 1000:               # mdeg 추정
+        return [float(x)/RAD2MDEG for x in vec6]
+    elif m > 10:               # deg 추정
+        return [math.radians(float(x)) for x in vec6]
+    else:                      # rad 추정
+        return [float(x) for x in vec6]
+
+
+def _extract_six_from_obj(msg):
+    """ArmJoint/ArmJointCtrl/리스트/딕트/문자열 repr 대응 → [j1..j6] (rad)"""
+    if msg is None:
         return None
 
+    # 0) 리스트/튜플/넘파이
+    try:
+        as_list = list(msg)
+        if len(as_list) >= 6:
+            return _unit_to_rad(as_list[:6])
+    except TypeError:
+        pass
+
+    # 1) dict
+    if isinstance(msg, dict):
+        # (a) 평범한 키들
+        collected = []
+        for names in _JOINT_NAME_SETS:
+            cand = []
+            for n in names:
+                if n in msg: cand.append(msg[n])
+            if len(cand) >= 6:
+                return _unit_to_rad(cand[:6])
+        # (b) 중첩 구조 펼치기
+        flat = []
+        def walk(x):
+            if isinstance(x, dict):
+                for v in x.values(): walk(v)
+            elif isinstance(x, (list, tuple)):
+                for v in x: walk(v)
+            else:
+                try: flat.append(float(x))
+                except: pass
+        walk(msg)
+        if len(flat) >= 6:
+            return _unit_to_rad(flat[:6])
+
+    # 2) 객체: 바로 필드로 보유
+    for names in _JOINT_NAME_SETS:
+        if all(hasattr(msg, n) for n in names):
+            return _unit_to_rad([getattr(msg, n) for n in names])
+
+    # 3) ArmJoint{ joint_state: ... } / ArmJointCtrl{ joint_ctrl: ... }
+    for child_name in ("joint_state", "joint_ctrl"):
+        if hasattr(msg, child_name):
+            child = getattr(msg, child_name)
+            # 3-1) 자식이 필드로 보유
+            for names in _JOINT_NAME_SETS:
+                if all(hasattr(child, n) for n in names):
+                    return _unit_to_rad([getattr(child, n) for n in names])
+            # 3-2) 자식이 벡터스러운 경우
+            try:
+                as_list = list(child)
+                if len(as_list) >= 6:
+                    return _unit_to_rad(as_list[:6])
+            except TypeError:
+                pass
+            # 3-3) 자식 repr에서 정규식 파싱
+            s = str(child)
+            out = [None]*6
+            for m in _JOINT_REGEX.finditer(s):
+                i = int(m.group(1))-1; val = float(m.group(2))
+                if 0 <= i < 6: out[i] = val
+            if all(v is not None for v in out):
+                return _unit_to_rad(out)
+
+    # 4) 마지막: 자기 repr에서 정규식 파싱
+    s = str(msg)
+    out = [None]*6
+    for m in _JOINT_REGEX.finditer(s):
+        i = int(m.group(1))-1; val = float(m.group(2))
+        if 0 <= i < 6: out[i] = val
+    if all(v is not None for v in out):
+        return _unit_to_rad(out)
+
+    return None
+
+def try_read_current_joints_v2(p, timeout_s=3.0, poll_hz=50.0, verbose=True):
+    """
+    현재 6개 관절값을 읽어서 반환.
+    - 1순위: GetArmJointCtrl()  (셋포인트)
+    - 2순위: GetArmJointMsgs()  (실측 피드백)
+    - (참고) GetArmStatus()는 문자열/상태라 보통 관절값 없음. 로그만 찍음.
+
+    반환: list[6] (float), 단위는 그대로(라디안/도/mdeg 감지해서 로그로 알려줌)
+    """
+    import time
+    import math
+
+    def _is_vec6(x):
+        try:
+            return x is not None and len(x) == 6 and all(isinstance(v, (int, float)) and math.isfinite(v) for v in x)
+        except Exception:
+            return False
+
+    def _unit_hint(v6):
+        """대략 단위 추정 (로그용)"""
+        m = max(abs(float(x)) for x in v6)
+        if m > 1000:
+            return "mdeg(?)"
+        elif m > 10:
+            return "deg(?)"
+        else:
+            return "rad(?)"
+
+    def _fmt(x, n=3):
+        try:
+            return "[" + ", ".join(f"{float(v):.3f}" for v in x) + "]"
+        except Exception:
+            return str(x)
+
+    # 당신이 이미 갖고 있는 추출기 활용하되, 실패 시 로그 남김
+    def _safe_extract(tag, obj):
+        if verbose:
+            raw = getattr(obj, "__dict__", obj)
+            print(f"[{tag}] type={type(obj).__name__} raw={raw}")
+        try:
+            vals = _extract_six_from_obj(obj)  # <-- 당신이 정의한 추출 함수
+            if _is_vec6(vals):
+                if verbose:
+                    print(f"[{tag}] vec6={_fmt(vals)} (unit { _unit_hint(vals) })")
+                return vals
+            else:
+                if verbose:
+                    print(f"[{tag}] extract returned invalid vec6: {vals}")
+                return None
+        except Exception as e:
+            if verbose:
+                print(f"[{tag}] EXCEPTION in _extract_six_from_obj: {repr(e)}")
+            return None
+
+    deadline = time.time() + timeout_s
+    period = max(1.0 / max(poll_hz, 1.0), 0.001)
+    i = 0
+
+    while time.time() < deadline:
+        i += 1
+        if verbose:
+            print(f"\n--- poll #{i} ---")
+
+        # 1) 실측 피드백(강력 추천)
+        try:
+            get_msgs = getattr(p, "GetArmJointMsgs", None)
+            if get_msgs is not None:
+                mm = get_msgs()
+                vals = _safe_extract("MSGS", mm)
+                if _is_vec6(vals):
+                    return vals
+            else:
+                if verbose:
+                    print("[MSGS] SKIP: p.GetArmJointMsgs not available")
+        except Exception as e:
+            if verbose:
+                print(f"[MSGS] call EXCEPTION: {repr(e)}")
+
+        # 2) 컨트롤(셋포인트) — TEACHING이면 대부분 0
+        try:
+            m = p.GetArmJointCtrl()
+            vals = _safe_extract("CTRL", m)
+            if _is_vec6(vals):
+                return vals
+        except Exception as e:
+            if verbose:
+                print(f"[CTRL] call EXCEPTION: {repr(e)}")
+
+        # 3) 참고용 상태 문자열
+        try:
+            st = p.GetArmStatus()
+            if verbose:
+                txt = st if isinstance(st, str) else getattr(st, "__dict__", st)
+                print(f"[STAT] {txt}")
+        except Exception as e:
+            if verbose:
+                print(f"[STAT] call EXCEPTION: {repr(e)}")
+
+        time.sleep(period)
+
+    if verbose:
+        print("[TIMEOUT] failed to read a valid 6-joint vector.")
+    return None
+
+
 def soft_estop_v2(p: Optional[C_PiperInterface_V2], q_ticks: Optional[List[int]]):
-    """
-    Best-effort: 현재 자세 유지 재명령 + 속도스케일 0.
-    (펌웨어마다 해석 다를 수 있음. 하드 E-Stop 병행 권장)
-    """
+    """Best-effort: 속도스케일 0 + 현재자세 재명령"""
     try:
         if p:
-            # 속도 스케일 0 시도 (group=0x01 arm, mode=0x01 joint pos)
-            p.MotionCtrl_2(0x01, 0x01, 0, 0x00)
+            p.MotionCtrl_2(0x01, 0x01, 0, 0x00)  # speed=0
             if q_ticks and len(q_ticks) == 6:
                 p.JointCtrl(q_ticks[0], q_ticks[1], q_ticks[2], q_ticks[3], q_ticks[4], q_ticks[5])
             print("[ESTOP] Hold current pose command sent (speed=0).")
@@ -246,10 +489,30 @@ def main():
     ap.add_argument("--print_prompt", action="store_true")
     ap.add_argument("--estop_key", type=str, default="e", help="Press this key to E-Stop (default: 'e')")
     ap.add_argument("--speed", type=int, default=30, help="Speed scale 0..100 for MotionCtrl_2")
+
+    # 수동 7DoF 입력 (OpenVLA 우회)
+    ap.add_argument("--action", nargs=7, type=float,
+                    help="[dx dy dz droll dpitch dyaw grip_mm] (EE-local)")
+    ap.add_argument("--action-file", type=str,
+                    help="JSON 파일 경로 (list[7] 또는 {'action':[7]})")
+
     args = ap.parse_args()
 
-    # 0) Prompt for instruction if missing
-    if not args.instruction:
+    # 수동 action 로더
+    def load_action_from_args(args):
+        if args.action and len(args.action) == 7:
+            return [float(x) for x in args.action]
+        if args.action_file:
+            with open(args.action_file, "r") as f:
+                data = json.load(f)
+            arr = data["action"] if isinstance(data, dict) else data
+            if len(arr) != 7:
+                raise ValueError("action must have 7 values")
+            return [float(x) for x in arr]
+        return None
+
+    # 0) Prompt for instruction if missing (OpenVLA 경로에서만 쓰임)
+    if not args.instruction and load_action_from_args(args) is None:
         try:
             print("\n===============================")
             print("🤖  OpenVLA → PiPER V2 (8bit, one-shot)")
@@ -264,56 +527,65 @@ def main():
 
     print(f"[*] device: cuda (8-bit only)")
     print(f"[*] model: {args.model_path}")
-    print(f"[*] instruction: {args.instruction}")
-
-    # 1) image + model
-    image = load_image(args.image_path, args.image_url)
-    processor, vla = load_model_8bit(args.model_path)
-
-    prompt = get_openvla_prompt(args.instruction, args.model_path)
-    if args.print_prompt:
-        print(f"\n[Prompt]\n{prompt}\n")
+    if args.instruction:
+        print(f"[*] instruction: {args.instruction}")
 
     # 키 리스너
     start_estop_key_listener(args.estop_key)
 
-    inputs = processor(prompt, image).to("cuda", dtype=torch.float16)
-    if ESTOP_REQUESTED: raise SystemExit("[ESTOP] Before inference.")
-
-    # 2) inference
-    t0 = time.time()
-    action = vla.predict_action(**inputs, unnorm_key=args.unnorm_key, do_sample=False)
-    dt = time.time() - t0
-
-    if hasattr(action, "tolist"):
-        action = action.tolist()
-    action = [float(x) for x in action]
-    if len(action) != 7:
-        raise RuntimeError(f"Expected 7-DoF action, got len={len(action)}")
+    # 1) action 결정 (수동 입력 우선)
+    action = load_action_from_args(args)
+    if action is None:
+        # OpenVLA 경로 사용
+        image = load_image(args.image_path, args.image_url)
+        processor, vla = load_model_8bit(args.model_path)
+        prompt = get_openvla_prompt(args.instruction, args.model_path)
+        if args.print_prompt:
+            print(f"\n[Prompt]\n{prompt}\n")
+        inputs = processor(prompt, image).to("cuda", dtype=torch.float16)
+        if ESTOP_REQUESTED: raise SystemExit("[ESTOP] Before inference.")
+        t0 = time.time()
+        action = vla.predict_action(**inputs, unnorm_key=args.unnorm_key, do_sample=False)
+        dt = time.time() - t0
+        if hasattr(action, "tolist"):
+            action = action.tolist()
+        action = [float(x) for x in action]
+        if len(action) != 7:
+            raise RuntimeError(f"Expected 7-DoF action, got len={len(action)}")
+        print(f"[OK] Inference: {dt:.3f}s")
+    else:
+        print("[OK] Using manual action (skip OpenVLA).")
 
     dx, dy, dz, dr, dp, dyaw, grip_mm = action
-    print(f"[OK] Inference: {dt:.3f}s")
     print("Action (EE-local): [dx, dy, dz, droll, dpitch, dyaw, grip_mm]")
     print([round(v, 5) for v in action])
 
-    # 3) IK pipeline
-    chain = build_chain(args.urdf, last_link="gripper_base")
+    # 2) IK pipeline
+    chain = build_chain(args.urdf)
+
+    debug_chain(chain)
+    global JOINT_NAMES
+    JOINT_NAMES = resolve_joint_names(chain)
+    print("[IK] JOINT_NAMES:", JOINT_NAMES)
+    set_active_mask_for_six(chain, JOINT_NAMES)
+
+
 
     # V2 connect + enable + current joints
     v2 = C_PiperInterface_V2(args.can)
     v2.ConnectPort()
-    # enable 시도
-    t_en = time.time()
-    while time.time() - t_en < 3.0:
-        try:
-            if v2.EnablePiper():
-                break
-        except Exception:
-            pass
-        time.sleep(0.05)
 
-    time.sleep(0.02)
-    q_curr = try_read_current_joints_v2(v2)
+    # Enable 최대 3초 재시도
+    print("[*] Waiting for piper to be enabled...")
+    while not v2.EnablePiper():
+        time.sleep(0.01)
+    print("[OK] Piper enabled.")
+
+    # 모션 모드로 진입 (arm pos mode) + 조금 기다리기
+    v2.MotionCtrl_2(0x01, 0x01, int(clamp(args.speed, 0, 100)), 0x00)
+    time.sleep(0.5)
+
+    q_curr = try_read_current_joints_v2(v2, timeout_s=1.0, poll_hz=50.0)
     if q_curr is None:
         if not args.q_init:
             raise RuntimeError("현재 조인트를 SDK(V2)에서 읽지 못했습니다. --q_init j1..j6 제공 필요")
@@ -347,7 +619,7 @@ def main():
         print("[Dryrun/ESTOP] No motion sent.")
         return
 
-    # 4) send to PiPER (V2 ticks path)
+    # 3) send to PiPER (V2 ticks path)
     # 모션모드: 그룹=0x01(arm), 모드=0x01(joint pos), 속도스케일=args.speed
     v2.MotionCtrl_2(0x01, 0x01, int(clamp(args.speed, 0, 100)), 0x00)
 
@@ -362,9 +634,8 @@ def main():
     if ESTOP_REQUESTED:
         soft_estop_v2(v2, _last_q_ticks)
         raise SystemExit("[ESTOP] Before gripper command.")
-    g_ticks = grip_mm_to_tick(grip_mm)         # mm → m → um
-    g_ticks = abs(g_ticks)
-    v2.GripperCtrl(g_ticks, 1000, 0x01, 0x00)  # set_zero=0x00(일반)
+    g_ticks = abs(grip_mm_to_tick(grip_mm))   # mm → m → um
+    v2.GripperCtrl(g_ticks, 1000, 0x01, 0x00) # set_zero=0x00(일반)
 
     if ESTOP_REQUESTED:
         soft_estop_v2(v2, _last_q_ticks)
@@ -373,11 +644,14 @@ def main():
     time.sleep(0.3)
     print("[OK] Sent to PiPER V2 (one-shot)")
 
-    # 5) optional save json
+    # 4) optional save json
     if args.save_json:
         Path(args.save_json).parent.mkdir(parents=True, exist_ok=True)
         with open(args.save_json, "w") as f:
-            json.dump({"action": action, "q_target": q_target, "q_ticks": q_ticks, "g_ticks": g_ticks}, f, indent=2)
+            json.dump(
+                {"action": action, "q_target": q_target, "q_ticks": q_ticks, "g_ticks": g_ticks},
+                f, indent=2
+            )
         print(f"[*] Saved to {args.save_json}")
 
 if __name__ == "__main__":
